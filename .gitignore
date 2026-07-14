@@ -2,3 +2,4 @@
 venv/
 checkpoints/
 *.onnx
+*.engine
