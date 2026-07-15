@@ -3,3 +3,6 @@ venv/
 checkpoints/
 *.onnx
 *.engine
+onnx_verification
+trt_verification
+*.txt

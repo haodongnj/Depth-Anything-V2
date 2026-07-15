@@ -4,3 +4,9 @@ matplotlib
 opencv-python
 torch
 torchvision
+
+# --- verification scripts (verify_*.py) ---
+onnx>=1.16.0
+onnxruntime>=1.20.0
+pycuda>=2024.1         # TRT inference — requires CUDA toolkit
+# tensorrt              # not on PyPI; install via: pip install nvidia-tensorrt
