@@ -3,6 +3,7 @@ venv/
 checkpoints/
 *.onnx
 *.engine
-onnx_verification
-trt_verification
-*.txt
+# Verify script outputs
+*_results/
+*.csv
+verify_report_*.txt
