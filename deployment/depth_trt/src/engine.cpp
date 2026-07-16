@@ -33,6 +33,8 @@ public:
     }
 };
 
+static Logger s_logger;
+
 // RAII helper for reading binary file
 std::vector<char> readFile(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -87,15 +89,13 @@ int64_t tensorElementCount(const nvinfer1::Dims& d) {
 // ---------------------------------------------------------------------------
 
 Engine::Engine(const std::string& engine_path) {
-    Logger logger;
-
     // 1. Read engine file
     std::vector<char> engine_data = readFile(engine_path);
     std::printf("[*] Loaded engine file: %s (%.1f MB)\n",
                 engine_path.c_str(), engine_data.size() / (1024.0 * 1024.0));
 
     // 2. Create runtime and deserialize
-    runtime_ = nvinfer1::createInferRuntime(logger);
+    runtime_ = nvinfer1::createInferRuntime(s_logger);
     if (!runtime_) {
         std::fprintf(stderr, "ERROR: createInferRuntime returned null\n");
         std::exit(1);
@@ -155,7 +155,7 @@ Engine::Engine(const std::string& engine_path) {
     CHECK_CUDA(cudaMalloc(&d_output_, output_bytes_));
 
     // 6. Create CUDA stream
-    CHECK_CUDA(cudaStreamCreate(reinterpret_cast<cudaStream_t*>(&stream_)));
+    CHECK_CUDA(cudaStreamCreate(&stream_));
 
     // 7. Set static tensor addresses (input shape will be set per-inference)
     context_->setTensorAddress(input_name_.c_str(), d_input_);
@@ -166,12 +166,14 @@ Engine::Engine(const std::string& engine_path) {
 }
 
 Engine::~Engine() {
-    if (stream_) {
-        cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream_));
-        cudaStreamDestroy(reinterpret_cast<cudaStream_t>(stream_));
-    }
+    // 1. Synchronize stream to ensure all pending work completes
+    cudaStreamSynchronize(stream_);
+    // 2. Free device buffers while stream still valid (safe after sync)
     cudaFree(d_input_);
     cudaFree(d_output_);
+    // 3. Destroy the stream
+    cudaStreamDestroy(stream_);
+    // 4. Destroy TRT objects
     delete context_;
     delete engine_;
     delete runtime_;
@@ -193,11 +195,10 @@ void Engine::infer(const float* preprocessed, float* output) {
 
     // 3. Copy input to device
     CHECK_CUDA(cudaMemcpyAsync(d_input_, preprocessed, input_bytes_,
-                                cudaMemcpyHostToDevice,
-                                reinterpret_cast<cudaStream_t>(stream_)));
+                                cudaMemcpyHostToDevice, stream_));
 
     // 4. Execute
-    bool ok = context_->enqueueV3(reinterpret_cast<cudaStream_t>(stream_));
+    bool ok = context_->enqueueV3(stream_);
     if (!ok) {
         std::fprintf(stderr, "ERROR: enqueueV3 failed\n");
         std::exit(1);
@@ -205,12 +206,10 @@ void Engine::infer(const float* preprocessed, float* output) {
 
     // 5. Copy output back
     std::size_t out_bytes = static_cast<std::size_t>(out_res.h) * out_res.w * sizeof(float);
-    CHECK_CUDA(cudaMemcpyAsync(output, d_output_, out_bytes,
-                                cudaMemcpyDeviceToHost,
-                                reinterpret_cast<cudaStream_t>(stream_)));
+    CHECK_CUDA(cudaMemcpyAsync(output, d_output_, out_bytes, cudaMemcpyDeviceToHost, stream_));
 
     // 6. Synchronize
-    cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream_));
+    cudaStreamSynchronize(stream_);
 }
 
 } // namespace depth_trt

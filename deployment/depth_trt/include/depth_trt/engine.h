@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cuda_runtime.h>
 #include <memory>
 #include <string>
 
@@ -62,7 +63,7 @@ private:
     std::size_t input_bytes_  = 0;
     std::size_t output_bytes_ = 0;
 
-    void* stream_ = nullptr;  // cudaStream_t
+    cudaStream_t stream_ = nullptr;
 };
 
 } // namespace depth_trt

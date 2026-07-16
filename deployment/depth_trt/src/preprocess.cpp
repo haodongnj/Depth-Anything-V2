@@ -1,6 +1,7 @@
 // deployment/depth_trt/src/preprocess.cpp
 #include "depth_trt/preprocess.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,23 +22,29 @@ cv::Mat preprocess(const cv::Mat& bgr, Resolution target) {
     rgb.convertTo(rgb, CV_32FC3, 1.0 / 255.0);
 
     // 2. Center-crop to target aspect ratio
-    float target_aspect = static_cast<float>(target.w) / static_cast<float>(target.h);
-    float src_aspect = static_cast<float>(rgb.cols) / static_cast<float>(rgb.rows);
-
+    // If source is smaller than target in either dimension, skip crop and resize directly.
     cv::Mat cropped;
-    if (std::abs(src_aspect - target_aspect) < 1e-4f) {
-        // Already matches — no crop needed, but we'll copy to avoid aliasing issues
+    if (rgb.cols <= target.w || rgb.rows <= target.h) {
+        // Image is smaller — no crop, resize directly (INTER_CUBIC handles upscale)
         cropped = rgb.clone();
-    } else if (src_aspect > target_aspect) {
-        // Source is wider — crop left/right
-        int new_w = static_cast<int>(rgb.rows * target_aspect);
-        int x0 = (rgb.cols - new_w) / 2;
-        cropped = rgb(cv::Rect(x0, 0, new_w, rgb.rows)).clone();
     } else {
-        // Source is taller — crop top/bottom
-        int new_h = static_cast<int>(rgb.cols / target_aspect);
-        int y0 = (rgb.rows - new_h) / 2;
-        cropped = rgb(cv::Rect(0, y0, rgb.cols, new_h)).clone();
+        float target_aspect = static_cast<float>(target.w) / static_cast<float>(target.h);
+        float src_aspect = static_cast<float>(rgb.cols) / static_cast<float>(rgb.rows);
+
+        if (std::abs(src_aspect - target_aspect) < 1e-4f) {
+            // Already matches — no crop needed, but clone to avoid aliasing
+            cropped = rgb.clone();
+        } else if (src_aspect > target_aspect) {
+            // Source is wider — crop left/right
+            int new_w = static_cast<int>(rgb.rows * target_aspect);
+            int x0 = (rgb.cols - new_w) / 2;
+            cropped = rgb(cv::Rect(x0, 0, new_w, rgb.rows)).clone();
+        } else {
+            // Source is taller — crop top/bottom
+            int new_h = static_cast<int>(rgb.cols / target_aspect);
+            int y0 = (rgb.rows - new_h) / 2;
+            cropped = rgb(cv::Rect(0, y0, rgb.cols, new_h)).clone();
+        }
     }
 
     // 3. Resize exactly to target dimensions (INTER_CUBIC matches Python)
