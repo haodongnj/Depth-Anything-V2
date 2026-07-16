@@ -57,9 +57,27 @@ void checkCuda(cudaError_t err, const char* file, int line) {
 }
 #define CHECK_CUDA(call) checkCuda(call, __FILE__, __LINE__)
 
+// Extract spatial (H, W) from a tensor shape.
+// For 4D [N, C, H, W] → uses d[2], d[3].
+// For 3D [N, H, W]  → uses d[1], d[2].
 Resolution dimsToResolution(const nvinfer1::Dims& d) {
-    // d.d[0]=batch, d.d[1]=channels, d.d[2]=H, d.d[3]=W
-    return Resolution{static_cast<int>(d.d[2]), static_cast<int>(d.d[3])};
+    if (d.nbDims == 4) {
+        return Resolution{static_cast<int>(d.d[2]), static_cast<int>(d.d[3])};
+    } else if (d.nbDims == 3) {
+        return Resolution{static_cast<int>(d.d[1]), static_cast<int>(d.d[2])};
+    }
+    // Fallback: treat the last two dims as H, W
+    return Resolution{static_cast<int>(d.d[d.nbDims - 2]),
+                      static_cast<int>(d.d[d.nbDims - 1])};
+}
+
+// Compute total element count for a tensor shape (replace dynamic dims with 1).
+int64_t tensorElementCount(const nvinfer1::Dims& d) {
+    int64_t count = 1;
+    for (int32_t i = 0; i < d.nbDims; ++i) {
+        count *= (d.d[i] > 0 ? d.d[i] : 1);
+    }
+    return count;
 }
 
 } // anonymous namespace
@@ -105,23 +123,22 @@ Engine::Engine(const std::string& engine_path) {
         auto dtype = engine_->getTensorDataType(name);
 
         const char* mode_str = (mode == nvinfer1::TensorIOMode::kINPUT) ? "Input" : "Output";
-        std::printf("    %s: %-20s  shape=[%lld,%lld,%lld,%lld]  dtype=%d\n",
-                    mode_str, name,
-                    (long long)shape.d[0], (long long)shape.d[1],
-                    (long long)shape.d[2], (long long)shape.d[3],
-                    static_cast<int>(dtype));
+        std::printf("    %s: %-20s  shape=[", mode_str, name);
+        for (int32_t j = 0; j < shape.nbDims; ++j) {
+            std::printf("%lld%s", (long long)shape.d[j],
+                        j + 1 < shape.nbDims ? "," : "");
+        }
+        std::printf("]  dtype=%d\n", static_cast<int>(dtype));
 
         if (std::strcmp(name, "image") == 0 && mode == nvinfer1::TensorIOMode::kINPUT) {
             input_name_ = name;
             input_res_ = dimsToResolution(shape);
-            input_bytes_ = (shape.d[0] > 0 ? shape.d[0] : 1) * shape.d[1]
-                         * shape.d[2] * shape.d[3] * sizeof(float);
+            input_bytes_ = tensorElementCount(shape) * sizeof(float);
             found_input = true;
         } else if (std::strcmp(name, "depth") == 0 && mode == nvinfer1::TensorIOMode::kOUTPUT) {
             output_name_ = name;
             output_res_ = dimsToResolution(shape);
-            output_bytes_ = (shape.d[0] > 0 ? shape.d[0] : 1) * shape.d[1]
-                          * shape.d[2] * shape.d[3] * sizeof(float);
+            output_bytes_ = tensorElementCount(shape) * sizeof(float);
             found_output = true;
         }
     }
@@ -172,8 +189,7 @@ void Engine::infer(const float* preprocessed, float* output) {
 
     // 2. Get output shape (may depend on input shape)
     auto out_dims = context_->getTensorShape(output_name_.c_str());
-    int out_h = static_cast<int>(out_dims.d[2]);
-    int out_w = static_cast<int>(out_dims.d[3]);
+    Resolution out_res = dimsToResolution(out_dims);
 
     // 3. Copy input to device
     CHECK_CUDA(cudaMemcpyAsync(d_input_, preprocessed, input_bytes_,
@@ -188,7 +204,7 @@ void Engine::infer(const float* preprocessed, float* output) {
     }
 
     // 5. Copy output back
-    std::size_t out_bytes = static_cast<std::size_t>(out_h) * out_w * sizeof(float);
+    std::size_t out_bytes = static_cast<std::size_t>(out_res.h) * out_res.w * sizeof(float);
     CHECK_CUDA(cudaMemcpyAsync(output, d_output_, out_bytes,
                                 cudaMemcpyDeviceToHost,
                                 reinterpret_cast<cudaStream_t>(stream_)));
