@@ -1,0 +1,2 @@
+add_executable(depth_camera main.cpp)
+target_link_libraries(depth_camera PRIVATE depth_trt opencv_highgui opencv_videoio)

@@ -10,3 +10,6 @@ precision_results/
 batch_test/
 *.csv
 *_report*.txt
+
+# Build artifacts
+deployment/build/
