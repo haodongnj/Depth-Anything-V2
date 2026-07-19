@@ -6,6 +6,10 @@
 #include <memory>
 #include <string>
 
+#ifdef DEPTH_TRT_LEGACY_API
+#include <vector>
+#endif
+
 #include "depth_trt/types.h"
 
 // Forward declarations (TRT types are in nvinfer1 namespace)
@@ -56,6 +60,11 @@ private:
 
     std::string input_name_;
     std::string output_name_;
+#ifdef DEPTH_TRT_LEGACY_API
+    int32_t input_binding_ = -1;
+    int32_t output_binding_ = -1;
+    std::vector<void*> bindings_;
+#endif
 
     // Device buffers
     void* d_input_  = nullptr;
