@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+# Export compile_commands.json for clangd LSP
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Allow the user to override CUDA arch
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89")  # Turing through Ada

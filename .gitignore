@@ -13,3 +13,4 @@ batch_test/
 
 # Build artifacts
 deployment/build/
+deployment/.cache/
