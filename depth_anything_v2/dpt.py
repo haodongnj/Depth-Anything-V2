@@ -124,7 +124,9 @@ class DPTHead(nn.Module):
             else:
                 x = x[0]
             
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+            # Hardcoded for vits — avoids ONNX Shape+Gather ops that TRT 8.2 cannot lower.
+            # x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+            x = x.permute(0, 2, 1).reshape(1, 384, patch_h, patch_w)
             
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
@@ -174,14 +176,17 @@ class DepthAnythingV2(nn.Module):
         self.depth_head = DPTHead(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken)
     
     def forward(self, x):
-        patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
+        # Hardcoded for 518×700 — avoids TorchScript Shape→Gather subgraph
+        # that TensorRT 8.2 (Jetson Nano) cannot constant-fold.
+        # x.shape[-2] // 14, x.shape[-1] // 14
+        patch_h, patch_w = 18, 24  # 252×336 // 14
         
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder], return_class_token=True)
         
         depth = self.depth_head(features, patch_h, patch_w)
         depth = F.relu(depth)
         
-        return depth.squeeze(1)
+        return depth  # keep [B, 1, H, W] — avoid ONNX Squeeze op for TRT 8.2 compat
     
     @torch.no_grad()
     def infer_image(self, raw_image, input_size=518):

@@ -180,7 +180,7 @@ class DinoVisionTransformer(nn.Module):
         previous_dtype = x.dtype
         npatch = x.shape[1] - 1
         N = self.pos_embed.shape[1] - 1
-        if npatch == N and w == h:
+        if npatch == N:  # w == h check removed — pre-interpolate pos_embed before export for TRT 8.2
             return self.pos_embed
         pos_embed = self.pos_embed.float()
         class_pos_embed = pos_embed[:, 0]

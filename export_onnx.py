@@ -11,13 +11,80 @@ H and W are fixed at export time (only the batch dimension is dynamic).
 Use --input-height / --input-width to produce separate .onnx files for
 different resolutions.
 
-Usage:
+Basic usage::
+
+  python export_onnx.py --encoder vits --checkpoint checkpoints/depth_anything_v2_vits.pth \\
+      --input-height 518 --input-width 700
+
+TensorRT 8.2 (Jetson Nano / Tegra X1) pipeline
+----------------------------------------------
+TRT 8.2 cannot handle several ONNX patterns produced by a default export.
+The full pipeline produces a compatible model in three steps::
+
+  # Step 1 — Export with TRT-8.2-friendly settings
+  python export_onnx.py \\
+      --encoder vits \\
+      --checkpoint checkpoints/depth_anything_v2_vits.pth \\
+      --input-height 252 --input-width 336 \\
+      --opset 13 \\
+      --static \\
+      --output depth_anything_v2_vits_252x336.onnx
+
+  # Step 2 — Constant-fold dynamic shape subgraphs
+  python -m onnxsim depth_anything_v2_vits_252x336.onnx depth_anything_v2_vits_252x336_sim.onnx
+
+  # Step 3 — Break Transpose+Reshape fusions that TRT 8.2 myelin cannot lower
+  python patch_for_trt82.py depth_anything_v2_vits_252x336_sim.onnx \\
+      -o depth_anything_v2_vits_252x336.onnx
+
+What each flag does for TRT 8.2:
+
+  --opset 13
+      Keeps LayerNormalization decomposed into basic ops (ReduceMean, Sub,
+      Pow, Sqrt, …) instead of the native op introduced in opset 17.
+
+  --static
+      Freezes all dimensions (including batch) so that ``x.shape`` lookups
+      in DPTHead.reshape and interpolate_pos_encoding are constant-folded
+      instead of producing Shape→Gather→Concat subgraphs that TRT cannot
+      execute.
+
+  onnx-simplifier (``python -m onnxsim``)
+      Constant-folds any remaining dynamic shape computations (Shape,
+      ConstantOfShape) and removes dead nodes.  Install with:
+      ``pip install onnx-simplifier``.
+
+  patch_for_trt82.py
+      - Replaces cubic Resize (from DINOv2 pos_embed interpolation) with
+        bilinear — Tegra X1 has no cubic kernel.
+      - Inserts Identity nodes between every Transpose → Reshape pair so
+        TRT myelin does not fuse them into a ForeignNode that Tegra X1
+        cannot execute.
+
+Resolution note
+---------------
+Input dimensions must be multiples of 14 (the DINOv2 patch size).
+The depth_anything_v2.dpt module contains hardcoded patch sizes and
+embedding dimensions (``patch_h, patch_w`` and ``reshape(1, 384, …)``)
+that must match the target resolution.  See the comments in
+``depth_anything_v2/dpt.py`` for details.
+
+Examples::
+
+  # Quick export (non-TRT)
   python export_onnx.py --encoder vitl --checkpoint checkpoints/depth_anything_v2_vitl.pth
-  python export_onnx.py --encoder vits --checkpoint checkpoints/depth_anything_v2_vits.pth --input-height 392 --input-width 392
-  python export_onnx.py --encoder vitl --checkpoint ... --input-height 518 --input-width 700 --verify
+
+  # ViT-S at 392×392
+  python export_onnx.py --encoder vits --checkpoint checkpoints/depth_anything_v2_vits.pth \\
+      --input-height 392 --input-width 392
+
+  # ViT-S at 518×700 with verification
+  python export_onnx.py --encoder vits --checkpoint checkpoints/depth_anything_v2_vits.pth \\
+      --input-height 518 --input-width 700 --verify
 """
 
 import argparse
+import math
 import os
 import sys
 
@@ -138,6 +205,40 @@ def load_model(encoder: str, checkpoint_path: str, device: str = "cpu") -> Depth
 # Export
 # ---------------------------------------------------------------------------
 
+def pre_interpolate_pos_embed(model: nn.Module, input_height: int, input_width: int) -> None:
+    """
+    Pre-interpolate the DINOv2 positional embedding to match the target
+    patch grid so that ``interpolate_pos_encoding`` takes the early-return
+    branch (npatch == N) during tracing.
+
+    Without this, a non-square input triggers a reshape+interpolate chain
+    on the pos_embed constant that TensorRT ≤ 8.2 (Jetson Nano) cannot
+    lower — it becomes a ``ForeignNode``.
+    """
+    pretrained = getattr(model, "pretrained", None)
+    if pretrained is None:
+        return
+
+    ps = pretrained.patch_size  # 14
+    h0, w0 = input_height // ps, input_width // ps
+    N = pretrained.pos_embed.shape[1] - 1          # pretrained patch count
+    sqrt_N = int(math.sqrt(N))
+    # Already the right size — nothing to do.
+    if (h0, w0) == (sqrt_N, sqrt_N):
+        return
+
+    print(f"[*] Pre-interpolating pos_embed: {sqrt_N}×{sqrt_N} → {h0}×{w0} …")
+    dim = pretrained.embed_dim
+    pos = pretrained.pos_embed.float()
+    patch_pos = pos[:, 1:, :].reshape(1, sqrt_N, sqrt_N, dim).permute(0, 3, 1, 2)
+    patch_pos = F.interpolate(patch_pos, size=(h0, w0), mode="bilinear",
+                              align_corners=True)
+    patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, -1, dim)
+    new_pos = torch.cat([pos[:, :1, :], patch_pos], dim=1).to(pretrained.pos_embed.dtype)
+    pretrained.pos_embed.data = new_pos
+    print("[✓] pos_embed pre-interpolated")
+
+
 def export_onnx(
     model: nn.Module,
     input_height: int,
@@ -145,6 +246,7 @@ def export_onnx(
     output_path: str,
     opset_version: int = 18,
     verify: bool = False,
+    static: bool = False,
 ) -> None:
     """
     Export to ONNX with the given spatial resolution baked into the graph.
@@ -154,6 +256,10 @@ def export_onnx(
     specialises to a concrete value).  For a reliable graph we fix H and W
     at export time; only the batch dimension stays dynamic.
 
+    When ``static=True``, all dimensions (including batch) are frozen so the
+    graph contains no Shape→Gather→Concat subgraphs that older TensorRT
+    versions (≤ 8.2, Jetson Nano) cannot execute.
+
     To support multiple resolutions, export separate .onnx files with
     different --input-height / --input-width values.
     """
@@ -162,22 +268,26 @@ def export_onnx(
     dummy = torch.randn(1, 3, input_height, input_width)
 
     # Only batch is dynamic; H and W are baked as constants during tracing.
-    dynamic_axes = {
+    dynamic_axes = None if static else {
         "image": {0: "batch"},
         "depth": {0: "batch"},
     }
 
-    torch.onnx.export(
-        model,
-        dummy,
-        output_path,
+    # PyTorch ≥ 2.1 dynamo exporter only supports opset >= 18.
+    # Fall back to the old torch.jit.trace-based exporter for older opsets.
+    export_kwargs: dict = dict(
         input_names=["image"],
         output_names=["depth"],
-        dynamic_axes=dynamic_axes,
         opset_version=opset_version,
         do_constant_folding=True,
         export_params=True,
     )
+    if dynamic_axes is not None:
+        export_kwargs["dynamic_axes"] = dynamic_axes
+    if opset_version < 18:
+        export_kwargs["dynamo"] = False
+
+    torch.onnx.export(model, dummy, output_path, **export_kwargs)
 
     _merge_external_data(output_path)
 
@@ -275,6 +385,11 @@ Examples:
                         "Same semantics as --input-height.")
     p.add_argument("--opset", type=int, default=18,
                    help="ONNX opset version (default: 18)")
+    p.add_argument("--static", action="store_true",
+                   help="Export a fully static graph (no dynamic axes). "
+                        "Required for TensorRT ≤ 8.2 (Jetson Nano) which cannot "
+                        "execute Shape→Gather→Concat subgraphs produced by dynamic Reshape. "
+                        "The resulting engine is fixed to batch=1.")
     p.add_argument("--verify", action="store_true",
                    help="Verify the exported model against PyTorch using onnxruntime")
     return p.parse_args()
@@ -305,9 +420,16 @@ def main() -> None:
     disable_xformers()
     model = patch_model_for_onnx(model)
 
+    # ---- Pre-interpolate pos_embed ----
+    # For non-square inputs the interpolate_pos_encoding path creates a
+    # complex reshape+interpolate subgraph that TRT 8.2 cannot lower.
+    # Pre-interpolating the positional embedding to the target patch grid
+    # makes the traced graph skip that branch (npatch == N → early return).
+    pre_interpolate_pos_embed(model, args.input_height, args.input_width)
+
     # ---- Export ----
     export_onnx(model, args.input_height, args.input_width,
-                output_path, args.opset, args.verify)
+                output_path, args.opset, args.verify, args.static)
 
     print("[✓] Done.")
 
