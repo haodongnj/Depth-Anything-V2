@@ -4,6 +4,7 @@
 //   depth_image --engine <path> --input <path> --output <path>
 //               --height <H> --width <W> [--grayscale]
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -76,10 +77,15 @@ Args parse_args(int argc, char** argv) {
 } // anonymous namespace
 
 int main(int argc, char** argv) {
+    using clock = std::chrono::high_resolution_clock;
+    auto total_start = clock::now();
+
     Args args = parse_args(argc, argv);
 
     // 1. Load engine
+    auto t0 = clock::now();
     depth_trt::Engine engine(args.engine_path);
+    auto t1 = clock::now();
 
     // 2. Validate resolution
     depth_trt::Resolution engine_res = engine.inputResolution();
@@ -100,14 +106,17 @@ int main(int argc, char** argv) {
     }
     std::printf("[*] Loaded image: %s (%dx%d)\n",
                 args.input_path.c_str(), bgr.cols, bgr.rows);
+    auto t2 = clock::now();
 
     // 4. Preprocess
     cv::Mat tensor = depth_trt::preprocess(bgr, engine_res);
+    auto t3 = clock::now();
 
     // 5. Infer
     depth_trt::Resolution out_res = engine.outputResolution();
     std::vector<float> depth(static_cast<std::size_t>(out_res.h) * out_res.w);
     engine.infer(tensor.ptr<float>(), depth.data());
+    auto t4 = clock::now();
 
     // 6. Visualize
     cv::Mat vis;
@@ -124,6 +133,19 @@ int main(int argc, char** argv) {
     }
     std::printf("[✓] Depth saved to: %s (%dx%d)\n",
                 args.output_path.c_str(), vis.cols, vis.rows);
+
+    auto t5 = clock::now();
+
+    // --- Timing report ---
+    auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    std::printf("\n[Timing]\n");
+    std::printf("  Engine load:  %8.1f ms\n", ms(t1 - t0));
+    std::printf("  Image read:   %8.1f ms\n", ms(t2 - t1));
+    std::printf("  Preprocess:   %8.1f ms\n", ms(t3 - t2));
+    std::printf("  Inference:    %8.1f ms\n", ms(t4 - t3));
+    std::printf("  Visual + save:%8.1f ms\n", ms(t5 - t4));
+    std::printf("  -------------------------\n");
+    std::printf("  Total:        %8.1f ms\n", ms(t5 - total_start));
 
     return 0;
 }
